@@ -78,16 +78,22 @@ def serialWriteNumToByte(port, token, var=None):  # Only to be used for c m u b 
         else:
             skillHeader = 7
             
+        # Determine frame size based on robot model
+        if hasattr(config, 'model_') and config.model_ and 'Chero' in config.model_:
+            maxJoints = 6
+        else:
+            maxJoints = 16
+            
         if period > 1:
             frameSize = 8  # gait
         elif period == 1:
-            frameSize = 16  # posture
+            frameSize = maxJoints  # posture
         else:
             frameSize = 20  # behavior
     # divide large angles by 2
         angleRatio = 1
         for row in range(abs(period)):
-            for angle in var[skillHeader + row * frameSize:skillHeader + row * frameSize + min(16,frameSize)]:
+            for angle in var[skillHeader + row * frameSize:skillHeader + row * frameSize + min(maxJoints,frameSize)]:
                 if angle > 125 or angle < -125:
                     angleRatio = 2
                     break
@@ -97,7 +103,7 @@ def serialWriteNumToByte(port, token, var=None):  # Only to be used for c m u b 
         if angleRatio == 2:
             var[3] = 2
             for row in range(abs(period)):
-                for i in range(skillHeader + row * frameSize,skillHeader + row * frameSize + min(16,frameSize)):
+                for i in range(skillHeader + row * frameSize,skillHeader + row * frameSize + min(maxJoints,frameSize)):
                     var[i] //=2
             printH('rescaled:\n',var)
             
@@ -172,12 +178,13 @@ def serialWriteByte(port, var=None):
 
 
 def printSerialMessage(port, token, timeout=0):
-    if token == 'k' or token == 'K':
+    if 'X' in token:
+        token = 'X'
+
+    if token == 'k' or token == 'K' or token == 'X':
         threshold = 8
     else:
         threshold = 3
-    if 'X' in token:
-        token = 'X'
     startTime = time.time()
     allPrints = ''
     while True:
@@ -197,7 +204,9 @@ def printSerialMessage(port, token, timeout=0):
                     # print(response, flush=True)
                     allPrints += response
         now = time.time()
-        if (now - startTime) > threshold:
+        timePassed = now - startTime
+        logger.debug(f"time passed is: {timePassed}")
+        if timePassed > threshold:
             # print('Elapsed time: ', end='')
             # print(threshold, end=' seconds\n', flush=True)
             logger.debug(f"Elapsed time: {threshold} seconds")
@@ -232,7 +241,7 @@ def sendTask(PortList, port, task, timeout=0):  # task Structure is [token, var=
                 #        print('c') #which case
                 serialWriteByte(port, task[1])
             token = task[0][0]
-#            printH("token",token)
+            # printH("token is:",token)
             if token == 'I' or token =='L':
                 timeout = 1 # in case the UI gets stuck
             lastMessage = printSerialMessage(port, token, timeout)
@@ -276,12 +285,20 @@ def splitTaskForLargeAngles(task):
         var = task[1]
         indexedList = list()
         if token == 'L':
-            for i in range(4):
-                for j in range(4):
-                    angle = var[4 * j + i]
+            # Determine grid size based on robot model
+            if hasattr(config, 'model_') and config.model_ and 'Chero' in config.model_:
+                gridSize = 2  # 2x3 grid for Chero
+                maxJoints = 6
+            else:
+                gridSize = 4  # 4x4 grid for other robots
+                maxJoints = 16
+                
+            for i in range(gridSize):
+                for j in range(gridSize):
+                    angle = var[gridSize * j + i]
                     if angle < -125 or angle > 125:
-                        indexedList += [4 * j + i, angle]
-                        var[4 * j + i] = max(min(angle, 125), -125)
+                        indexedList += [gridSize * j + i, angle]
+                        var[gridSize * j + i] = max(min(angle, 125), -125)
             if len(var):
                 queue.append(['L', var, task[-1]])
             if len(indexedList):
@@ -411,6 +428,26 @@ zeroNybble = [
     1, 0, 0, 1,
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, ]
 
+# DoF6 posture data - independent arrays for fine-tuning
+balanceDoF6 = [
+    1, 0, 0, 1,
+    0, 0, 0, 0, 0, 0]
+buttUpDoF6 = [
+    1, 0, 15, 1,
+    0, 0, -70, -70, -20, -20]
+restDoF6 = [
+    1, 0, 0, 1,
+    30, 0, 60, 60, -60, -60]
+sitDoF6 = [
+    1, 0, -20, 1,
+    60, 50, 30, 30, -50, -50]
+strDoF6 = [
+    1, 0, 0, 1,
+    10, 70, -75, -75, 75, 75]
+zeroDoF6 = [
+    1, 0, 0, 1,
+    0, 0, 0, 0, 0, 0]
+
 postureTableBittle = {
     "balance": balance,
     "buttUp": buttUp,
@@ -462,11 +499,22 @@ postureTableDoF16 = {
     "zero": zero
 }
 
+# DoF6 posture data - independent arrays for fine-tuning
+postureTableDoF6 = {
+    "balance": balanceDoF6,
+    "buttUp": buttUpDoF6,
+    "rest": restDoF6,
+    "sit": sitDoF6,
+    "str": strDoF6,
+    "zero": zeroDoF6
+}
+
 postureDict = {
     'Nybble': postureTableNybble,
     'Bittle': postureTableBittle,
     'BittleX+Arm': postureTableBittleR,
-    'DoF16': postureTableDoF16
+    'DoF16': postureTableDoF16,
+    'Chero': postureTableDoF6
 }
 
 skillFullName = {
@@ -523,11 +571,30 @@ def schedulerToSkill(ports, testSchedule):
     newSkill = []
     outputStr = ""
 
+    # Determine the correct posture table and number of joints based on model
+    global postureTable
+    if hasattr(config, 'model_') and config.model_:
+        if 'Chero' in config.model_:
+            currentPostureTable = postureDict['Chero']
+            numJoints = 6
+        elif 'Nybble' in config.model_:
+            currentPostureTable = postureDict['Nybble']
+            numJoints = 16
+        elif 'DoF16' in config.model_:
+            currentPostureTable = postureDict['DoF16']
+            numJoints = 16
+        else:  # Bittle or BittleX+Arm
+            currentPostureTable = postureDict['Bittle']
+            numJoints = 16
+    else:
+        currentPostureTable = postureTable
+        numJoints = 16
+
     for task in testSchedule:  # execute the tasks in the testSchedule
         print(task)
         token = task[0][0]
-        if token == 'k' and task[0][1:] in postureTable:
-            currentRow = postureTable[task[0][1:]][-16:]
+        if token == 'k' and task[0][1:] in currentPostureTable:
+            currentRow = currentPostureTable[task[0][1:]][-numJoints:]
             skillRow = copy.deepcopy(currentRow)
             compactSkillData.append(skillRow + [8, int(task[1] * 1000 / 500), 0, 0])
             newSkill = newSkill + skillRow + [8, int(task[1] * 1000 / 500), 0, 0]
@@ -541,7 +608,7 @@ def schedulerToSkill(ports, testSchedule):
             compactSkillData.append(skillRow + [8, int(task[2] * 1000 / 500), 0, 0])
             newSkill = newSkill + skillRow + [8, int(task[2] * 1000 / 500), 0, 0]
         elif token == 'L':
-            skillRow = copy.deepcopy(task[1][:16])
+            skillRow = copy.deepcopy(task[1][:numJoints])
             compactSkillData.append(skillRow + [8, int(task[2] * 1000 / 500), 0, 0])
             newSkill = newSkill + skillRow + [8, int(task[2] * 1000 / 500), 0, 0]
 
@@ -562,7 +629,7 @@ def schedulerToSkill(ports, testSchedule):
     for row in compactSkillData:
         if min(row) < -125 or max(row) > 125:
             angleRatio = 2
-        print(('{:>4},' * 20).format(*row))
+        print(('{:>4},' * (numJoints + 4)).format(*row))
     print('};')
     newSkill = list(map(lambda x: x // angleRatio, newSkill))
     newSkill = [-len(compactSkillData), 0, 0, angleRatio, 0, 0, 0] + newSkill
@@ -574,15 +641,28 @@ def getModelAndVersion(result):
     if result != -1:
         parse = result[1].replace('\r','').split('\n')
         for l in range(len(parse)):
-            if 'Nybble' in parse[l] or 'Bittle' in parse[l] or 'DoF16' in parse[l]:
+            if 'Nybble' in parse[l] or 'Bittle' in parse[l] or 'DoF16' in parse[l] or 'Chero' in parse[l]:
                 config.model_ = parse[l]
                 config.version_ = parse [l+1]
                 config.modelList += [config.model_]
                 print(config.model_)
                 print(config.version_)
+                updatePostureTable()
                 return
     config.model_ = 'Bittle'
     config.version_ = 'Unknown'
+    
+def updatePostureTable():
+    global postureTable
+    if hasattr(config, 'model_') and config.model_:
+        if 'Chero' in config.model_:
+            postureTable = postureDict['Chero']
+        elif 'Nybble' in config.model_:
+            postureTable = postureDict['Nybble']
+        elif 'DoF16' in config.model_:
+            postureTable = postureDict['DoF16']
+        else:  # Bittle or BittleX+Arm
+            postureTable = postureDict['Bittle']
     
 def deleteDuplicatedUsbSerial(list):
     for item in list:
@@ -611,7 +691,10 @@ def testPort(PortList, serialObject, p):
             result = result.read_all().decode('ISO-8859-1')
             if result != '':
                 print('Waiting for the robot to boot up')
-                time.sleep(2)
+                t = 2
+                logger.debug(f"time delay: {t}s.")
+                time.sleep(t)
+                
                 waitTime = 3
             else:
                 waitTime = 2
@@ -683,7 +766,7 @@ def keepCheckingPort(portList, cond1=None, check=True, updateFunc = lambda:None)
                     logger.debug(f"Adding serial port: {p}")
                     portName = p.split('/')[-1]
                     portStrList.insert(0, portName)  # remove '/dev/' in the port name
-                    tk.messagebox.showinfo(title=txt('Info'), message=txt('New port prompt') + portName)
+                    # Note: Do NOT show messagebox here as this runs in a background thread
             updateFunc()
         elif set(allPorts) - set(currentPorts):
             time.sleep(1) #usbmodem is slower in detection
@@ -900,11 +983,15 @@ def replug(PortList, needSendTask=True, needOpenPort=True):
     window.focus_force()  # new window gets focus
     window.mainloop()
     
-def selectList(PortList,ls,win, needSendTask=True, needOpenPort=True):
+def selectList(PortList,ls,win, portMap, needSendTask=True, needOpenPort=True):
     
     global goodPortCount
+    success = False
+    error_msg = None
+    
     for i in ls.curselection():
-        p = ls.get(i)#.split('/')[-1]
+        displayName = ls.get(i)
+        p = portMap.get(displayName, displayName)
         try:
             print(p)
             print(p.split('/')[-1])
@@ -919,40 +1006,79 @@ def selectList(PortList,ls,win, needSendTask=True, needOpenPort=True):
                 time.sleep(2)
                 result = sendTask(PortList, serialObject, ['?', 0])
                 getModelAndVersion(result)
-            win.withdraw()
+            success = True
 
         except Exception as e:
-            tk.messagebox.showwarning(title=txt('Warning'), message=txt('* Port ') + p + txt(' cannot be opened'))
+            error_msg = txt('* Port ') + p + txt(' cannot be opened')
+            logger.error(f"Cannot open {p}: {e}")
             print("Cannot open {}".format(p))
-            raise e
+    
+    # Close window first, then show any error messages
     win.destroy()
+    
+    if error_msg and not success:
+        tk.messagebox.showwarning(title=txt('Warning'), message=error_msg)
 
 def manualSelect(PortList, window, needSendTask=True, needOpenPort=True):
     # allPorts = deleteDuplicatedUsbSerial(Communication.Print_Used_Com())
     allPorts = Communication.Print_Used_Com()
+    
+    # Clear previous widgets to avoid conflicts
+    for widget in window.winfo_children():
+        widget.destroy()
+    
     window.title(txt('Manual mode'))
+    # Make window reasonably sized and resizable
+    try:
+        window.geometry('720x420+700+400')
+    except Exception:
+        pass
+    window.resizable(True, True)
+    window.grid_columnconfigure(0, weight=1)
+    window.grid_rowconfigure(2, weight=1)
     l1 = tk.Label(window, font = 'sans 14 bold')
     l1['text'] = txt('Manual mode')
-    l1.grid(row=0,column = 0)
+    l1.grid(row=0,column = 0, sticky='w', padx=5, pady=5)
     l2 = tk.Label(window, font='sans 14 bold')
     l2["text"]=txt('Please select the port from the list')
-    l2.grid(row=1,column=0)
-    ls = tk.Listbox(window,selectmode="multiple")
-    ls.grid(row=2,column=0)
+    l2.grid(row=1,column=0, sticky='w', padx=5)
+    ls = tk.Listbox(window, selectmode="browse")
+    ls.grid(row=2, column=0, sticky='nsew', padx=5, pady=5)
+
+    # Map display names to full paths (hide parent directories)
+    portMap = {}
+    def populate_listbox(ports):
+        ls.delete(0, tk.END)
+        portMap.clear()
+        nameCount = {}
+        for p in ports:
+            base = p.split('/')[-1]
+            # Ensure uniqueness if duplicates
+            disp = base
+            if base in nameCount:
+                nameCount[base] += 1
+                disp = f"{base} ({nameCount[base]})"
+            else:
+                nameCount[base] = 1
+            portMap[disp] = p
+            ls.insert(tk.END, disp)
+
+    populate_listbox(allPorts)
+
     def refreshBox(ls):
         # allPorts = deleteDuplicatedUsbSerial(Communication.Print_Used_Com())
-        allPorts = Communication.Print_Used_Com()
-        ls.delete(0,tk.END)
-        for p in allPorts:
-            ls.insert(tk.END,p)
-    for p in allPorts:
-        ls.insert(tk.END,p)
-    bu = tk.Button(window, text=txt('OK'), command=lambda:selectList(PortList, ls, window, needSendTask, needOpenPort))
-    bu.grid(row=2, column=1)
+        ports = Communication.Print_Used_Com()
+        populate_listbox(ports)
+
+    bu = tk.Button(window, text=txt('OK'), command=lambda:selectList(PortList, ls, window, portMap, needSendTask, needOpenPort))
+    bu.grid(row=2, column=1, sticky='n', padx=5, pady=5)
     bu2 = tk.Button(window, text=txt('Refresh'), command=lambda:refreshBox(ls))
-    bu2.grid(row=1, column=1)
-    tk.messagebox.showwarning(title=txt('Warning'), message=txt('Manual mode'))
-    window.mainloop()
+    bu2.grid(row=1, column=1, sticky='n', padx=5)
+    
+    # Show info message after window is ready, using after to avoid blocking
+    window.after(100, lambda: tk.messagebox.showinfo(title=txt('Info'), message=txt('Manual mode')))
+    
+    # Note: Do NOT call mainloop() here as the parent window already has one running
 
 def monitoringVoltage(ports, VoltagePin, timer, callback):
     while True and len(ports):

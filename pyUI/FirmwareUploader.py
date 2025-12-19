@@ -10,7 +10,6 @@
 from commonVar import *
 # from subprocess import check_call
 import subprocess
-import threading
 from tkinter import ttk
 from tkinter import filedialog
 import pathlib
@@ -81,11 +80,23 @@ class Uploader:
         self.win.protocol('WM_DELETE_WINDOW', self.on_closing)
         self.win.update()
 
+        # For macOS stability: Use main-thread timer instead of background thread
+        # Background threads cause Tkinter crashes on macOS when packaged
         self.keepChecking = True
-        t = threading.Thread(target=keepCheckingPort,
-                             args=(goodPorts, lambda: self.keepChecking, False, self.updatePortlist))
-        t.daemon = True
-        t.start()
+        
+        # Initialize lastPortList from actual system ports to avoid false "new port" detection
+        try:
+            from SerialCommunication import Communication
+            currentPorts = Communication.Print_Used_Com()
+            self.lastPortList = [p.split('/')[-1] for p in currentPorts]
+        except:
+            self.lastPortList = list(portStrList) if portStrList else []
+        
+        # Flag to prevent showing "new port" message on first check
+        self.isFirstCheck = True
+        
+        # Start port checking in main thread using timer
+        self.win.after(500, self.checkPortsMainThread)
 
         self.win.focus_force()    # force the main interface to get focus
         self.win.mainloop()
@@ -259,6 +270,31 @@ class Uploader:
         self.labPort = ttk.Label(fmSerial, text=txt('labPort'), font=('Arial', 16))
         self.labPort.grid(row=0, ipadx=5, padx=5, sticky=W)
         self.cbPort = ttk.Combobox(fmSerial, textvariable=self.strPort, foreground='blue', font=12)    # width=38,
+        
+        # Refresh port list from system to ensure we have all available ports
+        # This is especially important after manual port selection
+        try:
+            from SerialCommunication import Communication
+            
+            # Remember user's manually selected port (if any)
+            user_selected_port = portStrList[0] if len(portStrList) > 0 else None
+            
+            # Get all system ports
+            currentPorts = Communication.Print_Used_Com()
+            current_port_names = [p.split('/')[-1] for p in currentPorts]
+            
+            # Update global portStrList with all system ports
+            portStrList.clear()
+            portStrList.extend(current_port_names)
+            logger.info(f"Refreshed port list from system: {current_port_names}")
+            
+            # If user manually selected a port and it's still available, set it as current selection
+            if user_selected_port and user_selected_port in current_port_names:
+                self.strPort.set(user_selected_port)
+                logger.info(f"Preserved manually selected port: {user_selected_port}")
+        except Exception as e:
+            logger.error(f"Failed to refresh port list: {e}")
+        
         self.updatePortlist()
         self.cbPort.grid(row=1, ipadx=5, padx=5, sticky=W)
 
@@ -307,6 +343,7 @@ class Uploader:
         self.autoupload()
 
     def updatePortlist(self):
+        """Update port list in UI (called from main thread only)"""
         port_number_list = []
         if len(portStrList) == 0:
             port_number_list = [' ']
@@ -318,13 +355,170 @@ class Uploader:
                 logger.debug(f"{portName}")
                 port_number_list.append(portName)
             logger.debug(f"port_number_list is {port_number_list}")
+        
+        # Update UI directly (safe since we're always on main thread now)
         if self.OSname == 'aqua':
             self.updatePort()
         else:
-            self.cbPort.set(port_number_list[0])
-            # set list for Combobox
+            # Get current selection before updating list
+            currentSelection = self.strPort.get()
+            
+            # Update the combobox values
             self.cbPort['values'] = port_number_list
+            
+            # Preserve user's selection if it's still valid, otherwise select first port
+            if currentSelection and currentSelection in port_number_list:
+                # Keep current selection - user's choice should be preserved
+                self.cbPort.set(currentSelection)
+                logger.debug(f"Preserved user's port selection: {currentSelection}")
+            elif port_number_list:
+                # Only change to first port if current selection is invalid or empty
+                self.cbPort.set(port_number_list[0])
+                logger.debug(f"Auto-selected first port: {port_number_list[0]}")
 
+    def checkPortsMainThread(self):
+        """Check ports in main thread using timer (safe for macOS)"""
+        if not self.keepChecking:
+            return
+            
+        try:
+            # Import here to ensure it's available
+            from SerialCommunication import Communication
+            
+            # Get current port list
+            currentPorts = Communication.Print_Used_Com()
+            
+            # Convert to port names only (remove '/dev/' prefix)
+            current_port_names = [p.split('/')[-1] for p in currentPorts]
+            
+            # Check if ports changed
+            if set(current_port_names) != set(self.lastPortList):
+                logger.info(f"Port list changed: {current_port_names}")
+                
+                # Detect added and removed ports
+                added_ports = set(current_port_names) - set(self.lastPortList)
+                removed_ports = set(self.lastPortList) - set(current_port_names)
+                
+                # Get current selection
+                currentSelection = self.strPort.get()
+                
+                # Update global portStrList
+                portStrList.clear()
+                portStrList.extend(current_port_names)
+                
+                # Handle port changes
+                if added_ports:
+                    # New port(s) added
+                    logger.info(f"New port(s) added: {added_ports}")
+                    
+                    # Get board version to determine preferred port
+                    boardVer = self.strBoardVersion.get()
+                    added_list = sorted(added_ports)
+                    
+                    # Determine if we should show popup based on board version and ports
+                    should_show_popup = False
+                    preferred_port = None
+                    
+                    if boardVer in BiBoard_version_list:
+                        # For BiBoard, ONLY show popup when wchusbserial is detected
+                        # This avoids duplicate popups when both usbmodem and wchusbserial appear at different times
+                        for port in added_list:
+                            if 'wchusbserial' in port.lower():
+                                preferred_port = port
+                                should_show_popup = True
+                                break
+                        
+                        if not should_show_popup:
+                            # Detected other ports (like usbmodem) but not wchusbserial
+                            # Just update the port list silently, don't popup
+                            logger.info(f"BiBoard: Detected non-preferred ports {added_list}, updating list silently")
+                            self.updatePortlist()
+                    else:
+                        # For NyBoard, prefer usbmodem, then usbserial-
+                        for port in added_list:
+                            if 'usbmodem' in port.lower():
+                                preferred_port = port
+                                should_show_popup = True
+                                break
+                        if not preferred_port:
+                            for port in added_list:
+                                if 'usbserial-' in port.lower():
+                                    preferred_port = port
+                                    should_show_popup = True
+                                    break
+                        # If still not found, use the first one
+                        if not preferred_port and added_list:
+                            preferred_port = added_list[0]
+                            should_show_popup = True
+                    
+                    # Only show popup and auto-select if we found the preferred port
+                    if should_show_popup and preferred_port:
+                        new_port = preferred_port
+                        
+                        # Only show message if this is not the first check
+                        # (to avoid false "new port" message when opening the interface)
+                        if not self.isFirstCheck:
+                            # Show info message for preferred new port
+                            messagebox.showinfo(txt('Info'), txt('New port prompt') + new_port)
+                            self.force_focus()  # Force the main interface to get focus
+                            
+                            # Update UI and auto-select new port
+                            if self.OSname == 'aqua':
+                                # For macOS, update port list and it will handle selection
+                                self.updatePort()
+                                # But we want to force select the preferred new port
+                                if new_port in current_port_names:
+                                    self.cbPort.set(new_port)
+                            else:
+                                # For Windows/Linux, directly update and select
+                                self.cbPort['values'] = current_port_names
+                                self.cbPort.set(new_port)
+                            
+                            logger.info(f"Auto-selected preferred new port: {new_port}")
+                        else:
+                            # First check, just update UI without popup
+                            logger.info(f"First check - detected ports without popup: {added_ports}")
+                            self.updatePortlist()
+                    
+                elif removed_ports:
+                    # Port(s) removed
+                    logger.info(f"Port(s) removed: {removed_ports}")
+                    
+                    # Check if current selection was removed
+                    if currentSelection in removed_ports:
+                        logger.info(f"Current port {currentSelection} was removed")
+                        
+                        # Update UI
+                        if self.OSname == 'aqua':
+                            self.updatePort()
+                        else:
+                            self.cbPort['values'] = current_port_names
+                            if len(current_port_names) > 0:
+                                # Select first available port
+                                self.cbPort.set(current_port_names[0])
+                                logger.info(f"Switched to first available port: {current_port_names[0]}")
+                            else:
+                                # No ports available, set to empty
+                                self.cbPort.set('')
+                                logger.info("No ports available, cleared selection")
+                    else:
+                        # Current selection still valid, just update list
+                        self.updatePortlist()
+                
+                # Update last port list
+                self.lastPortList = current_port_names.copy()
+                
+                # Clear first check flag after first detection
+                if self.isFirstCheck:
+                    self.isFirstCheck = False
+                    logger.debug("First check completed, future changes will show notifications")
+        except Exception as e:
+            logger.error(f"Error checking ports: {e}")
+        
+        # Schedule next check (every 500ms)
+        if self.keepChecking:
+            self.win.after(500, self.checkPortsMainThread)
+    
     def about(self):
         self.msgbox = messagebox.showinfo(txt('titleVersion'), txt('msgVersion'))
         self.force_focus()
@@ -358,27 +552,40 @@ class Uploader:
         if self.OSname == 'aqua':
             list = copy.deepcopy(portStrList)
             boardVer = self.strBoardVersion.get()
+            
+            # Get current selection before updating
+            currentSelection = self.strPort.get()
+            
             if boardVer in NyBoard_version_list:
                 if len(list) > 0:
                     itemSet = " "
                     for item in list:
                         if 'usbmodem' in item:  # prefer the USB modem device because it can restart the NyBoard
-                            itemSet = itemSet
+                            itemSet = item
                             break
                         elif 'usbserial-' in item:  # prefer the "serial-" device
-                            itemSet = itemSet
+                            itemSet = item
                             break
                             
+                    # Remove unwanted ports (need to use list() to avoid modification during iteration)
+                    items_to_remove = []
                     for item in list:
-                        if 'wchusbserial' in item:
-                            list.remove(item)
-                        elif 'cu.SLAB_USBtoUART' in item:
-                            list.remove(item)
-                    if itemSet != " ":
-                        self.cbPort.set(itemSet)
-                    else:
-                        self.cbPort.set(list[0])
+                        if 'wchusbserial' in item or 'cu.SLAB_USBtoUART' in item:
+                            items_to_remove.append(item)
+                    for item in items_to_remove:
+                        list.remove(item)
+                    
+                    # Update values first
                     self.cbPort['values'] = list
+                    
+                    # Preserve user's selection if it's still valid
+                    if currentSelection and currentSelection in list:
+                        self.cbPort.set(currentSelection)
+                        logger.debug(f"Preserved user's port selection: {currentSelection}")
+                    elif itemSet != " " and itemSet in list:
+                        self.cbPort.set(itemSet)
+                    elif len(list) > 0:
+                        self.cbPort.set(list[0])
             elif boardVer == "BiBoard_V1_0":
                 if len(list) > 0:
                     itemSet = " "
@@ -390,20 +597,35 @@ class Uploader:
                             itemSet = item
                             break
                             
+                    # Remove unwanted ports (need to use list() to avoid modification during iteration)
+                    items_to_remove = []
                     for item in list:
-                        if 'usbmodem' in item:
-                            list.remove(item)
-                        elif 'cu.SLAB_USBtoUART' in item:
-                            list.remove(item)
-                    if itemSet != " ":
-                        self.cbPort.set(itemSet)
-                    else:
-                        self.cbPort.set(list[0])
+                        if 'usbmodem' in item or 'cu.SLAB_USBtoUART' in item:
+                            items_to_remove.append(item)
+                    for item in items_to_remove:
+                        list.remove(item)
+                    
+                    # Update values first
                     self.cbPort['values'] = list
+                    
+                    # Preserve user's selection if it's still valid
+                    if currentSelection and currentSelection in list:
+                        self.cbPort.set(currentSelection)
+                        logger.debug(f"Preserved user's port selection: {currentSelection}")
+                    elif itemSet != " " and itemSet in list:
+                        self.cbPort.set(itemSet)
+                    elif len(list) > 0:
+                        self.cbPort.set(list[0])
             else:
-                self.cbPort.set(list[0])
-                # set list for Combobox
+                # Update values first
                 self.cbPort['values'] = list
+                
+                # Preserve user's selection if it's still valid
+                if currentSelection and currentSelection in list:
+                    self.cbPort.set(currentSelection)
+                    logger.debug(f"Preserved user's port selection: {currentSelection}")
+                elif len(list) > 0:
+                    self.cbPort.set(list[0])
 
     def chooseBoardVersion(self, event):
         self.setActiveOption()
@@ -518,6 +740,9 @@ class Uploader:
         prompStr = ""
         counterIMU = 0
         while True:
+            # Use update_idletasks() instead of update() to avoid event loop nesting
+            # This updates the display without processing events, which is safer
+            self.win.update_idletasks()
             time.sleep(0.01)
             if serObj.main_engine.in_waiting > 0:
                 x = str(serObj.main_engine.readline())
@@ -682,266 +907,282 @@ class Uploader:
 
 
     def autoupload(self):
-        with open("./logfile.log", "r+", encoding="ISO-8859-1") as logfile:
-            lines = logfile.readlines()
-        time.sleep(1)
-        # Read the first three lines
-        first_three_lines = lines[:3]
-        for line in lines:
-            line = line.strip()  # remove the line break from each line
-            logger.debug(f"{line}")
-            if (".ino.hex" in line) or (".ino.bin" in line):
-                with open("./logfile.log", "w+", encoding="ISO-8859-1") as logfile:
-                    for line in first_three_lines:
-                        logfile.write(line)
-                break
-        logger.info(f"lastSetting: {self.lastSetting}.")
-        strProd = self.strProduct.get()
-        strDefaultPath = self.strFileDir.get()
-        strSoftwareVersion = self.strSoftwareVersion.get()
-        strBoardVersion = self.strBoardVersion.get()
-        strMode = self.inv_txt[self.strMode.get()]
-        self.currentSetting = [strProd, strDefaultPath, strSoftwareVersion, strBoardVersion, strMode]
-        logger.info(f"currentSetting: {self.currentSetting}.")
+        # No need to pause thread anymore - using main-thread timer now
+        try:
+            with open("./logfile.log", "r+", encoding="ISO-8859-1") as logfile:
+                lines = logfile.readlines()
+            time.sleep(1)
+            # Read the first three lines
+            first_three_lines = lines[:3]
+            for line in lines:
+                line = line.strip()  # remove the line break from each line
+                logger.debug(f"{line}")
+                if (".ino.hex" in line) or (".ino.bin" in line):
+                    with open("./logfile.log", "w+", encoding="ISO-8859-1") as logfile:
+                        for line in first_three_lines:
+                            logfile.write(line)
+                    break
+            logger.info(f"lastSetting: {self.lastSetting}.")
+            strProd = self.strProduct.get()
+            strDefaultPath = self.strFileDir.get()
+            strSoftwareVersion = self.strSoftwareVersion.get()
+            strBoardVersion = self.strBoardVersion.get()
+            strMode = self.inv_txt[self.strMode.get()]
+            self.currentSetting = [strProd, strDefaultPath, strSoftwareVersion, strBoardVersion, strMode]
+            logger.info(f"currentSetting: {self.currentSetting}.")
 
-        if self.strFileDir.get() == '' or self.strFileDir.get() == ' ':
-            messagebox.showwarning(txt('Warning'), txt('msgFileDir'))
-            self.force_focus()  # force the main interface to get focus
-            return False
+            if self.strFileDir.get() == '' or self.strFileDir.get() == ' ':
+                messagebox.showwarning(txt('Warning'), txt('msgFileDir'))
+                self.force_focus()  # force the main interface to get focus
+                return False
 
-        # NyBoard_V1_X software version are all the same
-        if "NyBoard_V1" in strBoardVersion:
-            pathBoardVersion = "NyBoard_V1"
-        else:
-            pathBoardVersion = strBoardVersion
-
-        if strProd == "Bittle X":
-            strProdPath = "Bittle"
-        elif strProd == "Bittle X+Arm":
-            strProdPath = "BittleX+Arm"
-        elif strProd == "Nybble Q":
-            strProdPath = "Nybble"
-        else:
-            strProdPath = strProd
-        path = self.strFileDir.get() + '/' + strSoftwareVersion + '/' + strProdPath + '/' + pathBoardVersion + '/'
-
-        if self.OSname == 'x11' or self.OSname == 'aqua':
-            port = '/dev/' + self.strPort.get()
-        else:
-            port = self.strPort.get()
-        logger.info(f"{self.strPort.get()}")
-        if port == ' ' or port == '':
-            messagebox.showwarning(txt('Warning'), txt('msgPort'))
-            self.force_focus()
-            return False
-
-        if strBoardVersion in NyBoard_version_list:
-            if self.bFacReset:
-                fnWriteI = path + 'WriteInstinctAutoInit.ino.hex'
-                fnOpenCat = path + 'OpenCatStandard.ino.hex'
-                self.currentSetting[4] = 'Standard'
+            # NyBoard_V1_X software version are all the same
+            if "NyBoard_V1" in strBoardVersion:
+                pathBoardVersion = "NyBoard_V1"
             else:
-                fnWriteI = path + 'WriteInstinct.ino.hex'
-                fnOpenCat = path + 'OpenCat' + strMode + '.ino.hex'
-            filename = [fnWriteI, fnOpenCat]
-            logger.info(f"{filename}")
-            uploadStage = ['Parameters', 'Main function']
-            for s in range(len(uploadStage)):
-                # if s == 0 and self.bParaUploaded and self.currentSetting[:4] == self.lastSetting[:4]:
-                # for NyBoard uplod mode only
-                if s == 0 and (not self.bParaUpload):
-                    continue               # no need upload configuration firmware
-                # if calibrate IMU failed
-                elif s == 1 and self.bIMUerror:
-                    continue               # no need upload main function firmware
+                pathBoardVersion = strBoardVersion
 
-                self.strStatus.set(txt('Uploading') + txt(uploadStage[s]) + '...' )
-                self.win.update()
-                # self.inProgress = True
-                # status = txt('Uploading') + txt(uploadStage[s]) + '.'
-                # t = threading.Thread(target=self.progressiveDots, args=(status,))
-                # t.start()
-                if self.OSname == 'win32':
-                    avrdudePath = resourcePath + 'avrdudeWin/'
-                elif self.OSname == 'x11':     # Linux
-                    avrdudePath = '/usr/bin/'
-                    path = pathlib.Path(avrdudePath + 'avrdude')
-                    if not path.exists():
-                        messagebox.showwarning(txt('Warning'), txt('msgNoneAvrdude'))
-                        self.force_focus()  # force the main interface to get focus
-                        return False
-                    # avrdudeconfPath = '/etc/avrdude/'      # Fedora / CentOS
-                    avrdudeconfPath = '/etc/'            # Debian / Ubuntu
+            if strProd == "Bittle X":
+                strProdPath = "Bittle"
+            elif strProd == "Bittle X+Arm":
+                strProdPath = "BittleX+Arm"
+            elif strProd == "Nybble Q":
+                strProdPath = "Nybble"
+            else:
+                strProdPath = strProd
+            path = self.strFileDir.get() + '/' + strSoftwareVersion + '/' + strProdPath + '/' + pathBoardVersion + '/'
+
+            if self.OSname == 'x11' or self.OSname == 'aqua':
+                port = '/dev/' + self.strPort.get()
+            else:
+                port = self.strPort.get()
+            logger.info(f"{self.strPort.get()}")
+            if port == ' ' or port == '':
+                messagebox.showwarning(txt('Warning'), txt('msgPort'))
+                self.force_focus()
+                return False
+
+            if strBoardVersion in NyBoard_version_list:
+                if self.bFacReset:
+                    fnWriteI = path + 'WriteInstinctAutoInit.ino.hex'
+                    fnOpenCat = path + 'OpenCatStandard.ino.hex'
+                    self.currentSetting[4] = 'Standard'
                 else:
-                    avrdudePath = resourcePath + 'avrdudeMac/'
+                    fnWriteI = path + 'WriteInstinct.ino.hex'
+                    fnOpenCat = path + 'OpenCat' + strMode + '.ino.hex'
+                filename = [fnWriteI, fnOpenCat]
+                logger.info(f"{filename}")
+                uploadStage = ['Parameters', 'Main function']
+                for s in range(len(uploadStage)):
+                    # if s == 0 and self.bParaUploaded and self.currentSetting[:4] == self.lastSetting[:4]:
+                    # for NyBoard uplod mode only
+                    if s == 0 and (not self.bParaUpload):
+                        continue               # no need upload configuration firmware
+                    # if calibrate IMU failed
+                    elif s == 1 and self.bIMUerror:
+                        continue               # no need upload main function firmware
 
-                try:
-                    # for NyBoard factory reset or upgrade firmware
-                    if s == 0 and self.bIMUerror:    # alread upload configuration firmware,but calibrate IMU failed
-                        pass                         # no need upload configuration firmware again
+                    self.strStatus.set(txt('Uploading') + txt(uploadStage[s]) + '...' )
+                    self.statusBar.update()
+                    # self.inProgress = True
+                    # status = txt('Uploading') + txt(uploadStage[s]) + '.'
+                    # t = threading.Thread(target=self.progressiveDots, args=(status,))
+                    # t.start()
+                    if self.OSname == 'win32':
+                        avrdudePath = resourcePath + 'avrdudeWin/'
+                    elif self.OSname == 'x11':     # Linux
+                        avrdudePath = '/usr/bin/'
+                        path = pathlib.Path(avrdudePath + 'avrdude')
+                        if not path.exists():
+                            messagebox.showwarning(txt('Warning'), txt('msgNoneAvrdude'))
+                            self.force_focus()  # force the main interface to get focus
+                            return False
+                        # avrdudeconfPath = '/etc/avrdude/'      # Fedora / CentOS
+                        avrdudeconfPath = '/etc/'            # Debian / Ubuntu
                     else:
-                        if self.OSname == 'x11':     # Linuxself.OSname == 'x11':     # Linux
-                            # check_call(avrdudePath + 'avrdude -C' + avrdudeconfPath + 'avrdude.conf -v -V -patmega328p -carduino -P%s -b115200 -D -Uflash:w:%s:i' % \
-                            #         (port, filename[s]), shell=self.shellOption)
-                            cmd = avrdudePath + 'avrdude -C' + avrdudeconfPath + 'avrdude.conf -v -V -patmega328p -carduino -P' + port + ' -b115200 -D -Uflash:w:' + \
-                                  filename[s] + ':i'
+                        avrdudePath = resourcePath + 'avrdudeMac/'
+
+                    try:
+                        # for NyBoard factory reset or upgrade firmware
+                        if s == 0 and self.bIMUerror:    # alread upload configuration firmware,but calibrate IMU failed
+                            pass                         # no need upload configuration firmware again
                         else:
-                            # check_call(avrdudePath + 'avrdude -C' + avrdudePath + 'avrdude.conf -v -V -patmega328p -carduino -P%s -b115200 -D -Uflash:w:%s:i > ./avrdude_log.txt 2> ./avrdude_errors.txt' % \
-                            #         (port, filename[s]), shell=self.shellOption)
-                            cmd = avrdudePath + 'avrdude -C' + avrdudePath + 'avrdude.conf -v -V -patmega328p -carduino -P' + port + ' -b115200 -D -Uflash:w:' + \
-                                  filename[s] + ':i'
+                            if self.OSname == 'x11':     # Linuxself.OSname == 'x11':     # Linux
+                                # check_call(avrdudePath + 'avrdude -C' + avrdudeconfPath + 'avrdude.conf -v -V -patmega328p -carduino -P%s -b115200 -D -Uflash:w:%s:i' % \
+                                #         (port, filename[s]), shell=self.shellOption)
+                                cmd = avrdudePath + 'avrdude -C' + avrdudeconfPath + 'avrdude.conf -v -V -patmega328p -carduino -P' + port + ' -b115200 -D -Uflash:w:' + \
+                                    filename[s] + ':i'
+                            else:
+                                # check_call(avrdudePath + 'avrdude -C' + avrdudePath + 'avrdude.conf -v -V -patmega328p -carduino -P%s -b115200 -D -Uflash:w:%s:i > ./avrdude_log.txt 2> ./avrdude_errors.txt' % \
+                                #         (port, filename[s]), shell=self.shellOption)
+                                cmd = avrdudePath + 'avrdude -C' + avrdudePath + 'avrdude.conf -v -V -patmega328p -carduino -P' + port + ' -b115200 -D -Uflash:w:' + \
+                                    filename[s] + ':i'
 
-                        # Run the program and capture output
-                        process = subprocess.Popen(cmd,shell = self.shellOption, stdout = subprocess.PIPE, stderr = subprocess.STDOUT)
-                        output, error = process.communicate()  # Wait for the program to finish
-                        # printH("error:", error)
-                        # printH("output:", output)
+                            # Run the program and capture output
+                            # Allow GUI to update display before blocking operation
+                            self.win.update_idletasks()
+                            process = subprocess.Popen(cmd,shell = self.shellOption, stdout = subprocess.PIPE, stderr = subprocess.STDOUT)
+                            output, error = process.communicate()  # Wait for the program to finish
+                            # Allow GUI to update display after operation
+                            self.win.update_idletasks()
+                            # printH("error:", error)
+                            # printH("output:", output)
 
-                        # Check for errors (optional)
-                        if error:
-                            logger.info(f"Error running program: {error}")
-                        else:
-                            # Write captured output to a file
-                            with open("./logfile.log", "a+", encoding="ISO-8859-1") as logfile:
-                                logfile.write(output.decode())  # Decode bytes to string
-                            time.sleep(1)
+                            # Check for errors (optional)
+                            if error:
+                                logger.info(f"Error running program: {error}")
+                            else:
+                                # Write captured output to a file
+                                with open("./logfile.log", "a+", encoding="ISO-8859-1") as logfile:
+                                    logfile.write(output.decode())  # Decode bytes to string
+                                time.sleep(1)
 
-                            with open("./logfile.log", "r+", encoding="ISO-8859-1") as logfile:
-                                lines = logfile.readlines()
-                            time.sleep(1)
+                                with open("./logfile.log", "r+", encoding="ISO-8859-1") as logfile:
+                                    lines = logfile.readlines()
+                                time.sleep(1)
 
-                            for line in lines:
-                                line = line.strip()  # remove the line break from each line
-                                logger.debug(f"{line}")
-                                if ("programmer is not responding" in line) or \
-                                    ("can\'t open device" in line) or \
-                                    ("attempt" in line) or \
-                                    ("error" in line) or ("Errno" in line):
-                                    status = txt(uploadStage[s]) + txt('failed to upload')
-                                    # self.strStatus.set(status)
-                                    # self.statusBar.update()
-                                    # messagebox.showinfo('Petoi Desktop App',txt('checkLogfile'))
-                                    self.showMessage(status)
-                                    return False
+                                for line in lines:
+                                    line = line.strip()  # remove the line break from each line
+                                    logger.debug(f"{line}")
+                                    if ("programmer is not responding" in line) or \
+                                        ("can\'t open device" in line) or \
+                                        ("attempt" in line) or \
+                                        ("error" in line) or ("Errno" in line):
+                                        status = txt(uploadStage[s]) + txt('failed to upload')
+                                        # self.strStatus.set(status)
+                                        # self.statusBar.update()
+                                        # messagebox.showinfo('Petoi Desktop App',txt('checkLogfile'))
+                                        self.showMessage(status)
+                                        return False
 
-                # self.inProgress = False
-                except:
-                    status = txt(uploadStage[s]) + txt('failed to upload')
+                    # self.inProgress = False
+                    except:
+                        status = txt(uploadStage[s]) + txt('failed to upload')
+                        self.strStatus.set(status)
+                        self.statusBar.update()
+                        messagebox.showwarning(txt('Warning'), txt('Replug prompt'))
+                        return False
+                    else:
+                        status = txt(uploadStage[s]) + txt('is successully uploaded')
+                    
                     self.strStatus.set(status)
                     self.statusBar.update()
-                    messagebox.showwarning(txt('Warning'), txt('Replug prompt'))
+
+                    if s == 0:
+                        self.WriteInstinctPrompts(port)
+                    else:
+                        pass
+            elif strBoardVersion in BiBoard_version_list:
+                modeName = "Standard"
+                # fnBootLoader = path + 'OpenCatEsp32Standard.ino.bootloader.bin'
+                fnBootLoader = path + 'OpenCatEsp32' + modeName + '.ino.bootloader.bin'
+                # fnPartitions = path + 'OpenCatEsp32Standard.ino.partitions.bin'
+                fnPartitions = path + 'OpenCatEsp32' + modeName + '.ino.partitions.bin'
+                # fnMainFunc = path + 'OpenCatEsp32Standard.ino.bin '
+                fnMainFunc = path + 'OpenCatEsp32' + modeName + '.ino.bin '
+                fnBootApp = path + 'boot_app0.bin'
+
+                filename = [fnBootLoader, fnPartitions, fnBootApp, fnMainFunc]
+                logger.info(f"{filename}")
+                self.strStatus.set(txt('Uploading') + txt('Main function') + ', ' + txt('Time consuming') + '...' )
+                self.statusBar.update()
+                if self.OSname == 'win32':   # Windows
+                    esptoolPath = resourcePath + 'esptoolWin/'
+                elif self.OSname == 'x11':  # Linux
+                    esptoolPath = '/usr/bin/'
+                    path = pathlib.Path(esptoolPath + 'esptool')
+                    if not path.exists():
+                        messagebox.showwarning(txt('Warning'), txt('msgNoneEsptool'))
+                        self.force_focus()  # force the main interface to get focus
+                        return False
+                else:    # Mac
+                    esptoolPath = resourcePath + 'esptoolMac/'
+                # print()
+                try:
+                    # check_call(esptoolPath + 'esptool --chip esp32 --port %s --baud 921600 --before default_reset --after hard_reset write_flash -z --flash_mode dio --flash_freq 80m --flash_size 16MB 0x1000 %s 0x8000 %s 0xe000 %s 0x10000 %s' % \
+                    # (port, filename[0], filename[1], filename[2], filename[3]), shell=self.shellOption)
+                    # subprocess.check_call(esptoolPath + 'esptool --chip esp32 --port %s --baud 921600 --before default_reset --after hard_reset write_flash -z --flash_mode dio --flash_freq 80m --flash_size 4MB 0x1000 %s 0x8000 %s 0xe000 %s 0x10000 %s' % \
+                    #     (port, filename[0], filename[1], filename[2], filename[3]), shell=self.shellOption)
+                    cmd = esptoolPath + 'esptool --chip esp32 --port ' + port + ' --baud 921600 --before default_reset --after hard_reset write_flash -z --flash_mode dio --flash_freq 80m --flash_size 4MB 0x1000 ' \
+                        + filename[0] + \
+                        ' 0x8000 ' + filename[1] + \
+                        ' 0xe000 ' + filename[2] + \
+                        ' 0x10000 ' + filename[3]
+                    # Run the program and capture output
+                    # Allow GUI to update display before blocking operation
+                    self.win.update_idletasks()
+                    process = subprocess.Popen(cmd, shell=self.shellOption, stdout=subprocess.PIPE,
+                                            stderr=subprocess.STDOUT)
+                    output, error = process.communicate()  # Wait for the program to finish
+                    # Allow GUI to update display after operation
+                    self.win.update_idletasks()
+                    # printH("error:", error)
+                    # printH("output:", output)
+
+                    # Check for errors (optional)
+                    if error:
+                        logger.info(f"Error running program: {error}")
+                    else:
+                        # Write captured output to a file
+                        with open("./logfile.log", "a+", encoding="ISO-8859-1") as logfile:
+                            logfile.write(output.decode())  # Decode bytes to string
+                        time.sleep(1)
+
+                        with open("./logfile.log", "r+", encoding="ISO-8859-1") as logfile:
+                            lines = logfile.readlines()
+                        time.sleep(1)
+
+                        for line in lines:
+                            line = line.strip()  # remove the line break from each line
+                            logger.debug(f"{line}")
+                            if ("Traceback" in line) or \
+                                ("Failed to connect to ESP32" in line) or \
+                                ("error" in line) or ("Errno" in line):
+                                status = txt('Main function') + txt('failed to upload')
+                                # self.strStatus.set(status)
+                                # self.statusBar.update()
+                                # messagebox.showinfo('Petoi Desktop App', txt('checkLogfile'))
+                                self.showMessage(status)
+                                return False
+
+                except Exception as e:
+                    printH("Excep:", e)
+                    logger.info(f"Excep: {e}")
+                    status = txt('Main function') + txt('failed to upload')
+                    # self.strStatus.set(status)
+                    # self.statusBar.update()
+                    self.showMessage(status)
                     return False
                 else:
-                    status = txt(uploadStage[s]) + txt('is successully uploaded')
-                
+                    status = txt('Main function') + txt('is successully uploaded')
+                    
                 self.strStatus.set(status)
                 self.statusBar.update()
+                self.WriteInstinctPrompts(port)
 
-                if s == 0:
-                    self.WriteInstinctPrompts(port)
-                else:
-                    pass
-        elif strBoardVersion in BiBoard_version_list:
-            modeName = "Standard"
-            # fnBootLoader = path + 'OpenCatEsp32Standard.ino.bootloader.bin'
-            fnBootLoader = path + 'OpenCatEsp32' + modeName + '.ino.bootloader.bin'
-            # fnPartitions = path + 'OpenCatEsp32Standard.ino.partitions.bin'
-            fnPartitions = path + 'OpenCatEsp32' + modeName + '.ino.partitions.bin'
-            # fnMainFunc = path + 'OpenCatEsp32Standard.ino.bin '
-            fnMainFunc = path + 'OpenCatEsp32' + modeName + '.ino.bin '
-            fnBootApp = path + 'boot_app0.bin'
-
-            filename = [fnBootLoader, fnPartitions, fnBootApp, fnMainFunc]
-            logger.info(f"{filename}")
-            self.strStatus.set(txt('Uploading') + txt('Main function') + ', ' + txt('Time consuming') + '...' )
-            self.win.update()
-            if self.OSname == 'win32':   # Windows
-                esptoolPath = resourcePath + 'esptoolWin/'
-            elif self.OSname == 'x11':  # Linux
-                esptoolPath = '/usr/bin/'
-                path = pathlib.Path(esptoolPath + 'esptool')
-                if not path.exists():
-                    messagebox.showwarning(txt('Warning'), txt('msgNoneEsptool'))
-                    self.force_focus()  # force the main interface to get focus
-                    return False
-            else:    # Mac
-                esptoolPath = resourcePath + 'esptoolMac/'
-            # print()
-            try:
-                # check_call(esptoolPath + 'esptool --chip esp32 --port %s --baud 921600 --before default_reset --after hard_reset write_flash -z --flash_mode dio --flash_freq 80m --flash_size 16MB 0x1000 %s 0x8000 %s 0xe000 %s 0x10000 %s' % \
-                # (port, filename[0], filename[1], filename[2], filename[3]), shell=self.shellOption)
-                # subprocess.check_call(esptoolPath + 'esptool --chip esp32 --port %s --baud 921600 --before default_reset --after hard_reset write_flash -z --flash_mode dio --flash_freq 80m --flash_size 4MB 0x1000 %s 0x8000 %s 0xe000 %s 0x10000 %s' % \
-                #     (port, filename[0], filename[1], filename[2], filename[3]), shell=self.shellOption)
-                cmd = esptoolPath + 'esptool --chip esp32 --port ' + port + ' --baud 921600 --before default_reset --after hard_reset write_flash -z --flash_mode dio --flash_freq 80m --flash_size 4MB 0x1000 ' \
-                      + filename[0] + \
-                      ' 0x8000 ' + filename[1] + \
-                      ' 0xe000 ' + filename[2] + \
-                      ' 0x10000 ' + filename[3]
-                # Run the program and capture output
-                process = subprocess.Popen(cmd, shell=self.shellOption, stdout=subprocess.PIPE,
-                                           stderr=subprocess.STDOUT)
-                output, error = process.communicate()  # Wait for the program to finish
-                # printH("error:", error)
-                # printH("output:", output)
-
-                # Check for errors (optional)
-                if error:
-                    logger.info(f"Error running program: {error}")
-                else:
-                    # Write captured output to a file
-                    with open("./logfile.log", "a+", encoding="ISO-8859-1") as logfile:
-                        logfile.write(output.decode())  # Decode bytes to string
-                    time.sleep(1)
-
-                    with open("./logfile.log", "r+", encoding="ISO-8859-1") as logfile:
-                        lines = logfile.readlines()
-                    time.sleep(1)
-
-                    for line in lines:
-                        line = line.strip()  # remove the line break from each line
-                        logger.debug(f"{line}")
-                        if ("Traceback" in line) or \
-                            ("Failed to connect to ESP32" in line) or \
-                            ("error" in line) or ("Errno" in line):
-                            status = txt('Main function') + txt('failed to upload')
-                            # self.strStatus.set(status)
-                            # self.statusBar.update()
-                            # messagebox.showinfo('Petoi Desktop App', txt('checkLogfile'))
-                            self.showMessage(status)
-                            return False
-
-            except Exception as e:
-                printH("Excep:", e)
-                logger.info(f"Excep: {e}")
-                status = txt('Main function') + txt('failed to upload')
-                # self.strStatus.set(status)
-                # self.statusBar.update()
-                self.showMessage(status)
-                return False
-            else:
-                status = txt('Main function') + txt('is successully uploaded')
+            self.lastSetting = self.currentSetting
+            if self.bFacReset:
+                self.strMode.set(txt('Standard'))
+            self.saveConfigToFile(defaultConfPath)
                 
-            self.strStatus.set(status)
-            self.statusBar.update()
-            self.WriteInstinctPrompts(port)
-
-        self.lastSetting = self.currentSetting
-        if self.bFacReset:
-            self.strMode.set(txt('Standard'))
-        self.saveConfigToFile(defaultConfPath)
-            
-        # for there is no calibrate IMU error
-        if not self.bIMUerror:
-            print('Finish!')
-            messagebox.showinfo(title=None, message=txt('msgFinish'))
-        self.force_focus()  # force the main interface to get focus
-        return True
+            # for there is no calibrate IMU error
+            if not self.bIMUerror:
+                print('Finish!')
+                messagebox.showinfo(title=None, message=txt('msgFinish'))
+            self.force_focus()  # force the main interface to get focus
+            return True
+        except Exception as e:
+            logger.error(f"Error in autoupload: {e}")
+            return False
         
     def force_focus(self):
         self.win.after(1, lambda: self.win.focus_force())
         
     def on_closing(self):
         if messagebox.askokcancel(txt('Quit'), txt('Do you want to quit?')):
+            # Stop main-thread timer
+            self.keepChecking = False
+            
             self.saveConfigToFile(defaultConfPath)
             logger.info(f"{self.configuration}")
             self.win.destroy()
